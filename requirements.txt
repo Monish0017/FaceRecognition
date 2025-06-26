@@ -1,11 +1,17 @@
 opencv-python>=4.7.0
 numpy>=1.23.0
-ultralytics>=8.0.0
-keras-facenet>=0.3.2
-mediapipe>=0.10.0
+mediapipe>=0.10.0  # We'll use only MediaPipe for face detection and landmarks
 scikit-learn>=1.2.0
-scikit-image>=0.19.0  # Correct package name for skimage
+scikit-image>=0.19.0
 scipy>=1.9.0
 matplotlib>=3.6.0
 tqdm>=4.65.0
-torch>=2.0.0
+onnxruntime>=1.15.0  # Keep for potential future use
+scipy>=1.9.0
+matplotlib>=3.6.0
+tqdm>=4.65.0
+# For Windows - no compilation needed
+onnx>=1.14.0
+# Optional for better performance
+# Only if you have GPU support
+# onnxruntime-gpu>=1.15.0

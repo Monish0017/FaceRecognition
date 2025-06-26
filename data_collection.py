@@ -2,14 +2,11 @@ import os
 import cv2
 import json
 import numpy as np
-import time
 from pathlib import Path
-from ultralytics import YOLO
-from keras_facenet import FaceNet
 import mediapipe as mp
 from datetime import datetime
-from skimage.feature import local_binary_pattern, hog  # Correct import statement
-from scipy.stats import entropy
+from scipy import spatial
+from onnx_embedder import get_face_embedding as get_onnx_face_embedding
 
 # Configure paths
 BASE_DIR = Path("d:/Face Recognition")
@@ -18,220 +15,147 @@ DATA_DIR.mkdir(exist_ok=True, parents=True)
 MODEL_DIR = BASE_DIR / "models"
 MODEL_DIR.mkdir(exist_ok=True, parents=True)
 
-# Initialize models - with model downloading if needed
-print("Loading models...")
-try:
-    # Try to use the face model if available
-    yolo = YOLO("yolov8n-face.pt")
-    using_face_model = True
-except FileNotFoundError:
-    print("Face detection model not found. Downloading yolov8n model...")
-    # Use the standard model that comes with ultralytics
-    yolo = YOLO("yolov8n.pt")
-    using_face_model = False
-    print("Model downloaded successfully.")
-
-print("Initializing FaceNet...")
-embedder = FaceNet()
-print("Initializing MediaPipe...")
-mp_face_mesh = mp.solutions.face_mesh
-pose_estimator = mp_face_mesh.FaceMesh(static_image_mode=True)
-
 # Constants for face validation
-FACE_MIN_SIZE = 80  # Minimum width and height for valid face detection
+FACE_MIN_SIZE = 50  # Minimum width and height for valid face detection
 MIN_CONF_THRESHOLD = 0.5  # Minimum confidence for face detection
 
-def detect_face(img):
-    """Detect face using YOLOv8 and return the cropped face with improved validation"""
-    if using_face_model:
-        # If using face-specific model, don't filter by class
-        results = yolo(img)
+# Initialize MediaPipe for face detection and landmarks
+print("Initializing MediaPipe models...")
+mp_face_detection = mp.solutions.face_detection
+mp_face_mesh = mp.solutions.face_mesh
+mp_drawing = mp.solutions.drawing_utils
+
+# Define key landmark indices for embedding
+KEY_LANDMARKS = [
+    1,    # Nose tip
+    33,   # Left eye inner corner
+    263,  # Right eye inner corner
+    61,   # Left mouth corner
+    291,  # Right mouth corner
+    199,  # Upper lip
+    164,  # Lower lip
+    4,    # Forehead center
+    5,    # Chin
+    93,   # Left eye center
+    323   # Right eye center
+]
+
+# Initialize face detector and landmark detector
+face_detector = mp_face_detection.FaceDetection(min_detection_confidence=MIN_CONF_THRESHOLD)
+face_mesh = mp_face_mesh.FaceMesh(
+    static_image_mode=True,
+    max_num_faces=1,
+    min_detection_confidence=0.5
+)
+
+def align_and_crop_face(image, landmarks, target_size=(160, 160)):
+    """Aligns and crops a face using facial landmarks"""
+    # Get key points
+    left_eye = np.mean([landmarks[i] for i in [362, 385, 387, 263, 373]], axis=0)
+    right_eye = np.mean([landmarks[i] for i in [33, 160, 158, 133, 153]], axis=0)
+    
+    # Convert relative to absolute coordinates
+    h, w = image.shape[:2]
+    left_eye = (left_eye[0] * w, left_eye[1] * h)
+    right_eye = (right_eye[0] * w, right_eye[1] * h)
+    
+    # Calculate center point between eyes
+    eye_center = ((left_eye[0] + right_eye[0]) / 2, (left_eye[1] + right_eye[1]) / 2)
+    
+    # Calculate angle for alignment
+    dx = right_eye[0] - left_eye[0]
+    dy = right_eye[1] - left_eye[1]
+    angle = np.degrees(np.arctan2(dy, dx))
+    
+    # Get rotation matrix
+    center = (int(eye_center[0]), int(eye_center[1]))
+    M = cv2.getRotationMatrix2D(center, angle, 1)
+    
+    # Apply rotation
+    height, width = image.shape[:2]
+    aligned = cv2.warpAffine(image, M, (width, height))
+    
+    # Calculate face size and crop area
+    eye_dist = np.linalg.norm([right_eye[0] - left_eye[0], right_eye[1] - left_eye[1]])
+    crop_width = int(3.5 * eye_dist)
+    crop_height = int(crop_width * target_size[1] / target_size[0])
+    
+    # Calculate crop coordinates
+    x = int(eye_center[0] - crop_width//2)
+    y = int(eye_center[1] - crop_height//3)  # Place eyes at 1/3 from top
+    
+    # Ensure crop region is within image bounds
+    x = max(0, min(x, width - crop_width))
+    y = max(0, min(y, height - crop_height))
+    
+    # Crop the face
+    if x + crop_width <= width and y + crop_height <= height:
+        cropped = aligned[y:y+crop_height, x:x+crop_width]
+        # Resize to target size
+        resized = cv2.resize(cropped, target_size)
+        return resized
     else:
-        # If using general model, filter for person class
-        results = yolo(img, classes=[0])  # Class 0 is person in COCO dataset
-    
-    for r in results:
-        boxes = r.boxes
-        if not boxes or len(boxes) == 0:
+        # Fallback to simple resize if crop coordinates are invalid
+        return cv2.resize(aligned, target_size)
+
+def get_face_embedding(face_img):
+    """Extract face embedding using ONNX model"""
+    try:
+        # Use ONNX model for embedding
+        embedding = get_onnx_face_embedding(face_img)
+        
+        if embedding is None:
+            print("Failed to get ONNX embedding")
             return None
         
-        # Get the highest confidence detection
-        conf = boxes.conf
-        if len(conf) > 0:
-            valid_detections = []
-            
-            # Collect all detections with confidence above threshold
-            for i in range(len(conf)):
-                if conf[i] >= MIN_CONF_THRESHOLD:
-                    x1, y1, x2, y2 = boxes.xyxy[i].cpu().numpy().astype(int)
-                    
-                    # Make sure coordinates are within image bounds
-                    h, w = img.shape[:2]
-                    x1, y1 = max(0, x1), max(0, y1)
-                    x2, y2 = min(w, x2), min(h, y2)
-                    
-                    # Ensure minimum face size and valid box
-                    if x2 > x1 and y2 > y1 and (x2 - x1) >= FACE_MIN_SIZE and (y2 - y1) >= FACE_MIN_SIZE:
-                        # Capture a bit more context around the face (20% padding)
-                        pad_x = int((x2 - x1) * 0.2)
-                        pad_y = int((y2 - y1) * 0.2)
-                        
-                        # Apply padding but stay within image bounds
-                        x1_pad = max(0, x1 - pad_x)
-                        y1_pad = max(0, y1 - pad_y)
-                        x2_pad = min(w, x2 + pad_x)
-                        y2_pad = min(h, y2 + pad_y)
-                        
-                        face_img = img[y1_pad:y2_pad, x1_pad:x2_pad]
-                        
-                        # Verify face using MediaPipe face mesh as additional validation
-                        img_rgb = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
-                        with mp_face_mesh.FaceMesh(
-                            static_image_mode=True,
-                            max_num_faces=1,
-                            min_detection_confidence=0.5) as face_mesh:
-                            
-                            results = face_mesh.process(img_rgb)
-                            if results.multi_face_landmarks:
-                                # If MediaPipe confirms it's a face, add to valid detections
-                                valid_detections.append((face_img, conf[i].item()))
-            
-            # Sort by confidence and return the best face
-            if valid_detections:
-                valid_detections.sort(key=lambda x: x[1], reverse=True)
-                return valid_detections[0][0]
-    
-    return None
-
-def estimate_pose(face_img):
-    """Estimate face pose using MediaPipe"""
-    img_rgb = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
-    res = pose_estimator.process(img_rgb)
-    if not res.multi_face_landmarks:
-        return None
-    
-    lm = res.multi_face_landmarks[0].landmark
-    left_eye = lm[33]
-    right_eye = lm[263]
-    nose = lm[1]
-    
-    dx = right_eye.x - left_eye.x
-    dy = right_eye.y - left_eye.y
-    yaw = np.degrees(np.arctan2(dy, dx))
-    pitch = np.degrees(np.arctan2(nose.z, nose.y))
-    
-    return (yaw, pitch)
-
-def get_custom_embedding(face_img, size=(160, 160)):
-    """Create a custom face embedding using multiple methods"""
-    try:
-        # Resize face to standard dimensions
-        face = cv2.resize(face_img, size)
-        
-        # Convert to grayscale for feature extraction
-        gray = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
-        
-        # Extract HOG features (Histogram of Oriented Gradients)
-        hog_features = hog(gray, orientations=8, pixels_per_cell=(16, 16),
-                        cells_per_block=(1, 1), visualize=False,
-                        block_norm='L2-Hys')
-        
-        # Extract LBP features (Local Binary Pattern)
-        radius = 2
-        n_points = 8 * radius
-        lbp = local_binary_pattern(gray, n_points, radius, method='uniform')
-        n_bins = int(lbp.max() + 1)
-        lbp_hist, _ = np.histogram(lbp, bins=n_bins, range=(0, n_bins), density=True)
-        
-        # Get color histograms for each channel
-        color_features = []
-        for i in range(3):  # BGR channels
-            hist = cv2.calcHist([face], [i], None, [64], [0, 256])
-            hist = cv2.normalize(hist, hist).flatten()
-            color_features.extend(hist)
-        
-        # Calculate image moments
-        moments = cv2.moments(gray)
-        hu_moments = cv2.HuMoments(moments).flatten()
-        
-        # Combine all features
-        combined_features = np.concatenate([
-            hog_features,
-            lbp_hist,
-            np.array(color_features),
-            np.log(np.abs(hu_moments) + 1e-10)  # Log transform Hu moments
-        ])
-        
-        # Normalize the combined feature vector
-        norm = np.linalg.norm(combined_features)
-        if norm > 0:
-            combined_features = combined_features / norm
-        
-        return combined_features
+        return embedding
     except Exception as e:
-        print(f"Error generating custom embedding: {e}")
+        print(f"Error getting face embedding: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
-def get_embedding(face_img):
-    """Get face embedding using a combination of FaceNet and custom features"""
-    try:
-        # Verify minimum size
-        if face_img.shape[0] < 50 or face_img.shape[1] < 50:
-            print("Face too small for reliable embedding")
-            return None
+def detect_face(img):
+    """Detect face using MediaPipe"""
+    # Convert to RGB for MediaPipe
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    
+    # Run face detection
+    with mp_face_detection.FaceDetection(
+        min_detection_confidence=MIN_CONF_THRESHOLD) as face_detector:
         
-        # Normalize the face with better preprocessing
-        face = cv2.resize(face_img, (160, 160))
+        detection_results = face_detector.process(img_rgb)
         
-        # Convert to RGB if needed
-        if len(face.shape) == 2:  # Grayscale
-            face = cv2.cvtColor(face, cv2.COLOR_GRAY2RGB)
-        elif face.shape[2] == 1:  # Single channel
-            face = cv2.cvtColor(face, cv2.COLOR_GRAY2RGB)
-        elif face.shape[2] == 4:  # RGBA
-            face = cv2.cvtColor(face, cv2.COLOR_RGBA2RGB)
-        
-        # Normalize pixel values
-        face_normalized = face.astype("float32") / 255.0
-        
-        # Get both FaceNet and custom embeddings
-        try:
-            facenet_embedding = embedder.embeddings([face_normalized])[0]
+        if detection_results.detections and len(detection_results.detections) > 0:
+            # Get the detection with highest confidence
+            detection = detection_results.detections[0]
             
-            # Check if FaceNet embedding is valid
-            if np.std(facenet_embedding) < 0.05:
-                print("Warning: Low variance in FaceNet embedding, may be unreliable")
-                facenet_valid = False
-            else:
-                facenet_valid = True
+            # Get bounding box
+            bbox = detection.location_data.relative_bounding_box
+            h, w, _ = img.shape
+            x1, y1 = int(bbox.xmin * w), int(bbox.ymin * h)
+            x2, y2 = int((bbox.xmin + bbox.width) * w), int((bbox.ymin + bbox.height) * h)
+            
+            # Ensure coordinates are valid
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
+            
+            # Check minimum size
+            if (x2 - x1) >= FACE_MIN_SIZE and (y2 - y1) >= FACE_MIN_SIZE:
+                # Add padding
+                pad_w = int((x2 - x1) * 0.2)
+                pad_h = int((y2 - y1) * 0.2)
                 
-            # Debug FaceNet embedding
-            embedding_min = np.min(facenet_embedding)
-            embedding_max = np.max(facenet_embedding)
-            embedding_mean = np.mean(facenet_embedding)
-            print(f"FaceNet stats - min: {embedding_min:.4f}, max: {embedding_max:.4f}, mean: {embedding_mean:.4f}")
-        except:
-            print("FaceNet embedding failed, using zeros")
-            facenet_embedding = np.zeros(512)
-            facenet_valid = False
-        
-        # Get custom embedding
-        custom_embedding = get_custom_embedding(face_img)
-        if custom_embedding is None:
-            return None
-            
-        print(f"Custom embedding shape: {custom_embedding.shape}, std: {np.std(custom_embedding):.4f}")
-        
-        # Use custom embedding if FaceNet isn't valid
-        if not facenet_valid:
-            print("Using only custom embedding")
-            return custom_embedding.tolist()
-        
-        # Return FaceNet embedding (still the best when it works properly)
-        return facenet_embedding.tolist()
-    except Exception as e:
-        print(f"Error getting embedding: {e}")
-        return None
+                x1_pad = max(0, x1 - pad_w)
+                y1_pad = max(0, y1 - pad_h)
+                x2_pad = min(w, x2 + pad_w)
+                y2_pad = min(h, y2 + pad_h)
+                
+                # Extract face
+                face_img = img[y1_pad:y2_pad, x1_pad:x2_pad].copy()
+                return face_img, (x1_pad, y1_pad, x2_pad, y2_pad)
+    
+    return None, None
 
 def capture_and_process():
     """Capture images from webcam and process them"""
@@ -256,63 +180,106 @@ def capture_and_process():
         return
     
     print("Ready to capture images. Press SPACE to capture, ESC to quit.")
-    count = 0
+    count = len(person_data["faces"])
+    
     while True:
         ret, frame = cap.read()
         if not ret:
             print("Error: Failed to read frame from webcam")
             break
             
-        # Display the frame
+        # Create a display frame
         display_frame = frame.copy()
         cv2.putText(display_frame, "Press SPACE to capture, ESC to quit", 
                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         
-        # Check for face pre-emptively to show status
-        face_detected = detect_face(frame) is not None
-        if face_detected:
-            cv2.putText(display_frame, "Face Detected", (10, 60), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        else:
-            cv2.putText(display_frame, "No Face Detected", (10, 60), 
+        # Pre-process frame to detect face
+        try:
+            # Run face detection for preview
+            face_img, bbox = detect_face(frame)
+            if face_img is not None:
+                x1, y1, x2, y2 = bbox
+                cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(display_frame, "Face Detected", (10, 60), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            else:
+                cv2.putText(display_frame, "No Face Detected", (10, 60), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        except Exception as e:
+            cv2.putText(display_frame, f"Detection Error: {str(e)}", (10, 60), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
         
+        # Show current count
+        cv2.putText(display_frame, f"Captures: {count}", (10, 90), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+        
+        # Display the frame
         cv2.imshow("Data Collection", display_frame)
         
+        # Process key presses
         key = cv2.waitKey(1) & 0xFF
         if key == 27:  # ESC key
             break
         elif key == 32:  # SPACE key
-            face = detect_face(frame)
-            if face is not None:
+            # Run face detection for capture
+            face_img, bbox = detect_face(frame)
+            
+            if face_img is not None:
                 # Process face
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 image_file = f"{person_name}_{timestamp}_{count}.jpg"
                 image_path = raw_images_dir / image_file
                 
                 try:
-                    # Save raw face image
-                    cv2.imwrite(str(image_path), face)
+                    # Save face image
+                    cv2.imwrite(str(image_path), face_img)
                     
-                    # Get pose
-                    pose = estimate_pose(face)
-                    if pose is None:
-                        pose = (0, 0)
-                        print("Warning: Could not estimate pose, using default (0,0)")
-                    
-                    # Get embedding with validation
-                    embedding = get_embedding(face)
+                    # Get embedding
+                    embedding = get_face_embedding(face_img)
                     if embedding is None:
                         print("Warning: Failed to get valid embedding, skipping this image")
-                        os.remove(str(image_path))  # Remove the invalid image
+                        if os.path.exists(str(image_path)):
+                            os.remove(str(image_path))  # Remove the invalid image
                         continue
+                    
+                    # Get face landmarks for pose estimation
+                    rgb_img = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
+                    mesh_results = face_mesh.process(rgb_img)
+                    
+                    # Default pose value
+                    pose = (0, 0, 0)  # yaw, pitch, roll
+                    
+                    # Calculate pose if landmarks are available
+                    if mesh_results.multi_face_landmarks:
+                        landmarks = mesh_results.multi_face_landmarks[0].landmark
+                        left_eye = np.mean([(landmarks[33].x, landmarks[33].y), 
+                                           (landmarks[263].x, landmarks[263].y)], axis=0)
+                        right_eye = np.mean([(landmarks[362].x, landmarks[362].y), 
+                                            (landmarks[263].x, landmarks[263].y)], axis=0)
+                        nose = landmarks[1]
+                        
+                        # Calculate simple pose estimation
+                        dx = right_eye[0] - left_eye[0]
+                        dy = right_eye[1] - left_eye[1]
+                        yaw = np.degrees(np.arctan2(dy, dx))
+                        
+                        nose_pos = (nose.x, nose.y)
+                        eye_center = ((left_eye[0] + right_eye[0])/2, (left_eye[1] + right_eye[1])/2)
+                        dx_nose = nose_pos[0] - eye_center[0]
+                        dy_nose = nose_pos[1] - eye_center[1]
+                        
+                        pitch = np.degrees(np.arctan2(dy_nose, dx_nose))
+                        roll = 0  # We don't calculate roll here
+                        
+                        pose = (float(yaw), float(pitch), float(roll))
                     
                     # Add to person data
                     face_data = {
                         "image": str(image_path),
-                        "embedding": embedding,
+                        "embedding": embedding.tolist(),
                         "pose": pose,
-                        "timestamp": timestamp
+                        "timestamp": timestamp,
+                        "bbox": bbox
                     }
                     person_data["faces"].append(face_data)
                     
@@ -324,8 +291,8 @@ def capture_and_process():
                     count += 1
                     
                     # Display success message and the face that was captured
-                    success_display = np.zeros((300, 300, 3), dtype=np.uint8)
-                    face_resized = cv2.resize(face, (200, 200))
+                    success_display = np.zeros((400, 400, 3), dtype=np.uint8)
+                    face_resized = cv2.resize(face_img, (300, 300))
                     h, w = face_resized.shape[:2]
                     success_display[50:50+h, 50:50+w] = face_resized
                     
@@ -340,10 +307,11 @@ def capture_and_process():
                     
                 except Exception as e:
                     print(f"Error processing face: {e}")
+                    import traceback
+                    traceback.print_exc()
             else:
                 print("No valid face detected!")
-                # Visual feedback for no face
-                cv2.putText(display_frame, "No Valid Face Detected!", (10, 90), 
+                cv2.putText(display_frame, "No Valid Face Detected!", (10, 120), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                 cv2.imshow("Data Collection", display_frame)
                 cv2.waitKey(500)
@@ -352,6 +320,7 @@ def capture_and_process():
     cv2.destroyAllWindows()
     print(f"Total images captured for {person_name}: {count}")
 
+
 if __name__ == "__main__":
     try:
         capture_and_process()
@@ -359,3 +328,4 @@ if __name__ == "__main__":
         print(f"An error occurred: {e}")
         import traceback
         traceback.print_exc()
+        input("Press Enter to exit...")
