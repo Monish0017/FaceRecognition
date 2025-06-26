@@ -3,3 +3,4 @@ face
 models
 yolov8n.pt
 __pycache__
+arcfaceresnet100-8.onnx

@@ -24,7 +24,7 @@ MODEL_DIR = BASE_DIR / "models"
 MODEL_DIR.mkdir(exist_ok=True, parents=True)
 
 # Constants
-SIMILARITY_THRESHOLD = 0.6  # Face recognition similarity threshold
+SIMILARITY_THRESHOLD = 0.3  # Face recognition similarity threshold
 FACE_MIN_SIZE = 50  # Minimum width and height for valid face detection
 MIN_CONF_THRESHOLD = 0.4  # Minimum confidence for face detection
 
